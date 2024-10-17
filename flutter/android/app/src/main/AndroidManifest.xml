@@ -30,7 +30,7 @@
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
                 <action android:name="android.intent.action.QUICKBOOT_POWERON" />
                 <!--ACTION_BOOT_COMPLETED for debug test on no root device-->
-                <action android:name="com.carriez.flutter_hbb.DEBUG_BOOT_COMPLETED" />
+                <action android:name="net.vipertec.vipersuporte.DEBUG_BOOT_COMPLETED" />
             </intent-filter>
         </receiver>
 
