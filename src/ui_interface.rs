@@ -3,10 +3,7 @@ use hbb_common::password_security;
 use hbb_common::{
     allow_err,
     bytes::Bytes,
-    config::{
-        self, keys::*, option2bool, Config, LocalConfig, PeerConfig, CONNECT_TIMEOUT,
-        RENDEZVOUS_PORT,
-    },
+    config::{self, keys::*, Config, LocalConfig, PeerConfig, CONNECT_TIMEOUT, RENDEZVOUS_PORT},
     directories_next,
     futures::future::join_all,
     log,
@@ -23,7 +20,6 @@ use serde_derive::Serialize;
 use std::process::Child;
 use std::{
     collections::HashMap,
-    sync::atomic::{AtomicUsize, Ordering},
     sync::{Arc, Mutex},
 };
 
@@ -209,10 +205,11 @@ pub fn use_texture_render() -> bool {
 
 #[inline]
 pub fn get_local_option(key: String) -> String {
-    LocalConfig::get_option(&key)
+    crate::get_local_option(&key)
 }
 
 #[inline]
+#[cfg(feature = "flutter")]
 pub fn get_hard_option(key: String) -> String {
     config::HARD_SETTINGS
         .read()
@@ -429,7 +426,10 @@ pub fn set_option(key: String, value: String) {
         ipc::set_options(options.clone()).ok();
     }
     #[cfg(any(target_os = "android", target_os = "ios"))]
-    Config::set_option(key, value);
+    {
+        let _nat = crate::CheckTestNatType::new();
+        Config::set_option(key, value);
+    }
 }
 
 #[inline]
@@ -479,18 +479,19 @@ pub fn set_socks(proxy: String, username: String, password: String) {
     ipc::set_socks(socks).ok();
     #[cfg(target_os = "android")]
     {
+        let _nat = crate::CheckTestNatType::new();
         if socks.proxy.is_empty() {
             Config::set_socks(None);
         } else {
             Config::set_socks(Some(socks));
         }
-        crate::common::test_nat_type();
         crate::RendezvousMediator::restart();
         log::info!("socks updated");
     }
 }
 
 #[inline]
+#[cfg(feature = "flutter")]
 pub fn get_proxy_status() -> bool {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     return ipc::get_proxy_status();
@@ -859,7 +860,7 @@ pub fn video_save_directory(root: bool) -> String {
         {
             let drive = std::env::var("SystemDrive").unwrap_or("C:".to_owned());
             let dir =
-                std::path::PathBuf::from(format!("{drive}\\ProgramData\\RustDesk\\recording",));
+                std::path::PathBuf::from(format!("{drive}\\ProgramData\\{appname}\\recording",));
             return dir.to_string_lossy().to_string();
         }
     }
@@ -874,7 +875,7 @@ pub fn video_save_directory(root: bool) -> String {
     #[cfg(any(target_os = "android", target_os = "ios"))]
     if let Ok(home) = config::APP_HOME_DIR.read() {
         let mut path = home.to_owned();
-        path.push_str("/RustDesk/ScreenRecord");
+        path.push_str(format!("/{appname}/ScreenRecord").as_str());
         let dir = try_create(&std::path::Path::new(&path));
         if !dir.is_empty() {
             return dir;
@@ -1150,13 +1151,7 @@ async fn check_connect_status_(reconnect: bool, rx: mpsc::UnboundedReceiver<ipc:
     let mut video_conn_count = 0;
     #[cfg(not(feature = "flutter"))]
     let mut id = "".to_owned();
-    #[cfg(any(
-        target_os = "windows",
-        all(
-            any(target_os = "linux", target_os = "macos"),
-            feature = "unix-file-copy-paste"
-        )
-    ))]
+    #[cfg(target_os = "windows")]
     let mut enable_file_transfer = "".to_owned();
     let is_cm = crate::common::is_cm();
 
@@ -1183,17 +1178,11 @@ async fn check_connect_status_(reconnect: bool, rx: mpsc::UnboundedReceiver<ipc:
                                 *OPTIONS.lock().unwrap() = v;
                                 *OPTION_SYNCED.lock().unwrap() = true;
 
-                                #[cfg(any(
-                                        target_os = "windows",
-                                        all(
-                                            any(target_os="linux", target_os = "macos"),
-                                            feature = "unix-file-copy-paste"
-                                            )
-                                        ))]
+                                #[cfg(target_os = "windows")]
                                 {
                                     let b = OPTIONS.lock().unwrap().get(OPTION_ENABLE_FILE_TRANSFER).map(|x| x.to_string()).unwrap_or_default();
                                     if b != enable_file_transfer {
-                                        clipboard::ContextSend::enable(option2bool(OPTION_ENABLE_FILE_TRANSFER, &b));
+                                        clipboard::ContextSend::enable(config::option2bool(OPTION_ENABLE_FILE_TRANSFER, &b));
                                         enable_file_transfer = b;
                                     }
                                 }
@@ -1305,6 +1294,13 @@ pub async fn change_id_shared(id: String, old_id: String) -> String {
 
 pub async fn change_id_shared_(id: String, old_id: String) -> &'static str {
     if !hbb_common::is_valid_custom_id(&id) {
+        log::debug!(
+            "debugging invalid id: \"{id}\", len: {}, base64: \"{}\"",
+            id.len(),
+            crate::encode64(&id)
+        );
+        let bom = id.trim_start_matches('\u{FEFF}');
+        log::debug!("bom: {}", hbb_common::is_valid_custom_id(&bom));
         return INVALID_FORMAT;
     }
 

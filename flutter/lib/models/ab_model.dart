@@ -58,6 +58,9 @@ class AbModel {
   String? _personalAbGuid;
   RxBool legacyMode = false.obs;
 
+  // Only handles peers add/remove
+  final Map<String, VoidCallback> _peerIdUpdateListeners = {};
+
   final sortTags = shouldSortTags().obs;
   final filterByIntersection = filterAbTagByIntersection().obs;
 
@@ -188,6 +191,7 @@ class AbModel {
         debugPrint("pull current Ab error: $e");
       }
     }
+    _callbackPeerUpdate();
     if (listInitialized && current.initialized) {
       _saveCache();
     }
@@ -343,6 +347,9 @@ class AbModel {
     if (ab == null) {
       return 'no such addressbook: $name';
     }
+    for (var p in ps) {
+      ab.removeNonExistentTags(p);
+    }
     String? errMsg = await ab.addPeers(ps);
     await pullNonLegacyAfterChange(name: name);
     if (name == _currentName.value) {
@@ -419,6 +426,7 @@ class AbModel {
         }
       });
     }
+    _callbackPeerUpdate();
     return ret;
   }
 
@@ -620,6 +628,9 @@ class AbModel {
           }
         }
       }
+      if (abEntries.isNotEmpty) {
+        _callbackPeerUpdate();
+      }
     }
   }
 
@@ -742,6 +753,20 @@ class AbModel {
     }
   }
 
+  void _callbackPeerUpdate() {
+    for (var listener in _peerIdUpdateListeners.values) {
+      listener();
+    }
+  }
+
+  void addPeerUpdateListener(String key, VoidCallback listener) {
+    _peerIdUpdateListeners[key] = listener;
+  }
+
+  void removePeerUpdateListener(String key) {
+    _peerIdUpdateListeners.remove(key);
+  }
+
 // #endregion
 }
 
@@ -753,7 +778,10 @@ abstract class BaseAb {
 
   final pullError = "".obs;
   final pushError = "".obs;
-  final abLoading = false.obs;
+  final abLoading = false
+      .obs; // Indicates whether the UI should show a loading state for the address book.
+  var abPulling =
+      false; // Tracks whether a pull operation is currently in progress to prevent concurrent pulls. Unlike abLoading, this is not tied to UI updates.
   bool initialized = false;
 
   String name();
@@ -768,17 +796,22 @@ abstract class BaseAb {
   }
 
   Future<void> pullAb({quiet = false}) async {
-    debugPrint("pull ab \"${name()}\"");
-    if (abLoading.value) return;
+    if (abPulling) return;
+    abPulling = true;
     if (!quiet) {
       abLoading.value = true;
       pullError.value = "";
     }
     initialized = false;
+    debugPrint("pull ab \"${name()}\"");
     try {
       initialized = await pullAbImpl(quiet: quiet);
-    } catch (_) {}
-    abLoading.value = false;
+    } catch (e) {
+      debugPrint("Error occurred while pulling address book: $e");
+    } finally {
+      abLoading.value = false;
+      abPulling = false;
+    }
   }
 
   Future<bool> pullAbImpl({quiet = false});
@@ -790,6 +823,18 @@ abstract class BaseAb {
 
   removePassword(Map<String, dynamic> p) {
     p.remove('password');
+  }
+
+  removeNonExistentTags(Map<String, dynamic> p) {
+    try {
+      final oldTags = p.remove('tags');
+      if (oldTags is List) {
+        final newTags = oldTags.where((e) => tagContainBy(e)).toList();
+        p['tags'] = newTags;
+      }
+    } catch (e) {
+      print("removeNonExistentTags: $e");
+    }
   }
 
   Future<bool> changeTagForPeers(List<String> ids, List<dynamic> tags);

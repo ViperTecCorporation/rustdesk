@@ -10,7 +10,7 @@
   <b>README, <a href="https://github.com/rustdesk/rustdesk/tree/master/src/lang">RustDesk UI</a> ve <a href="https://github.com/rustdesk/doc.rustdesk.com">RustDesk Belge</a>'sini ana dilinize çevirmemiz için yardımınıza ihtiyacımız var</b>
 </p>
 
-Bizimle sohbet edin: [Discord](https://discord.gg/nDceKgxnkV) | [Twitter](https://twitter.com/rustdesk) | [Reddit](https://www.reddit.com/r/rustdesk)
+Bizimle sohbet edin: [Discord](https://discord.gg/nDceKgxnkV) | [Twitter](https://twitter.com/rustdesk) | [Reddit](https://www.reddit.com/r/rustdesk) | [YouTube](https://www.youtube.com/@rustdesk)
 
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/I2I04VU09)
 
@@ -18,7 +18,7 @@ Başka bir uzak masaüstü yazılımı daha, Rust dilinde yazılmış. Hemen kul
 
 ![image](https://user-images.githubusercontent.com/71636191/171661982-430285f0-2e12-4b1d-9957-4a58e375304d.png)
 
-RustDesk, herkesten katkıyı kabul eder. Başlamak için [CONTRIBUTING.md](docs/CONTRIBUTING-TR.md) belgesine göz atın.
+RustDesk, herkesten katkıyı kabul eder. Başlamak için [CONTRIBUTING.md](CONTRIBUTING-TR.md) belgesine göz atın.
 
 [**SSS**](https://github.com/rustdesk/rustdesk/wiki/FAQ)
 
@@ -165,6 +165,10 @@ Lütfen bu komutları RustDesk deposunun kökünden çalıştırdığınızdan e
 - **[src/platform](https://github.com/rustdesk/rustdesk/tree/master/src/platform)**: platforma özgü kod
 - **[flutter](https://github.com/rustdesk/rustdesk/tree/master/flutter)**: mobil için Flutter kodu
 - **[flutter/web/js](https://github.com/rustdesk/rustdesk/tree/master/flutter/web/js)**: Flutter web istemcisi için JavaScript
+
+> [!Dikkat]
+> **Yanlış Kullanım Uyarısı:** <br>
+> RustDesk geliştiricileri, bu yazılımın etik olmayan veya yasa dışı kullanımını onaylamaz veya desteklemez. Yetkisiz erişim, kontrol veya gizlilik ihlali gibi kötüye kullanımlar kesinlikle yönergelerimize aykırıdır. Yazarlar, uygulamanın herhangi bir yanlış kullanımından sorumlu değildir.
 
 ## Ekran Görüntüleri
 

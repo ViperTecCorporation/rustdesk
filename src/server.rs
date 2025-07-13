@@ -24,13 +24,17 @@ use hbb_common::{
     sodiumoxide::crypto::{box_, sign},
     timeout, tokio, ResultType, Stream,
 };
+use scrap::camera;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use service::ServiceTmpl;
 use service::{EmptyExtraFieldService, GenericService, Service, Subscriber};
+use video_service::VideoSource;
 
 use crate::ipc::Data;
 
 pub mod audio_service;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub mod terminal_service;
 cfg_if::cfg_if! {
 if #[cfg(not(target_os = "ios"))] {
 mod clipboard_service;
@@ -68,6 +72,9 @@ mod service;
 mod video_qos;
 pub mod video_service;
 
+#[cfg(all(target_os = "windows", feature = "flutter"))]
+pub mod printer_service;
+
 pub type Childs = Arc<Mutex<Vec<std::process::Child>>>;
 type ConnMap = HashMap<i32, ConnInner>;
 
@@ -76,7 +83,6 @@ const CONFIG_SYNC_INTERVAL_SECS: f32 = 0.3;
 
 lazy_static::lazy_static! {
     pub static ref CHILD_PROCESS: Childs = Default::default();
-    pub static ref CONN_COUNT: Arc<Mutex<usize>> = Default::default();
     // A client server used to provide local services(audio, video, clipboard, etc.)
     // for all initiative connections.
     //
@@ -106,7 +112,13 @@ pub fn new() -> ServerPtr {
     #[cfg(not(target_os = "ios"))]
     {
         server.add_service(Box::new(display_service::new()));
-        server.add_service(Box::new(clipboard_service::new()));
+        server.add_service(Box::new(clipboard_service::new(
+            clipboard_service::NAME.to_owned(),
+        )));
+        #[cfg(feature = "unix-file-copy-paste")]
+        server.add_service(Box::new(clipboard_service::new(
+            clipboard_service::FILE_NAME.to_owned(),
+        )));
     }
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
@@ -122,6 +134,21 @@ pub fn new() -> ServerPtr {
             server.add_service(Box::new(input_service::new_window_focus()));
         }
     }
+    #[cfg(all(target_os = "windows", feature = "flutter"))]
+    {
+        match printer_service::init(&crate::get_app_name()) {
+            Ok(()) => {
+                log::info!("printer service initialized");
+                server.add_service(Box::new(printer_service::new(
+                    printer_service::NAME.to_owned(),
+                )));
+            }
+            Err(e) => {
+                log::error!("printer service init failed: {}", e);
+            }
+        }
+    }
+    // Terminal service is created per connection, not globally
     Arc::new(RwLock::new(server))
 }
 
@@ -222,7 +249,7 @@ pub async fn accept_connection(
     secure: bool,
 ) {
     if let Err(err) = accept_connection_(server, socket, secure).await {
-        log::error!("Failed to accept connection from {}: {}", peer_addr, err);
+        log::warn!("Failed to accept connection from {}: {}", peer_addr, err);
     }
 }
 
@@ -273,22 +300,53 @@ async fn create_relay_connection_(
 
 impl Server {
     fn is_video_service_name(name: &str) -> bool {
-        name.starts_with(video_service::NAME)
+        name.starts_with(VideoSource::Monitor.service_name_prefix())
+            || name.starts_with(VideoSource::Camera.service_name_prefix())
+    }
+
+    pub fn try_add_primary_camera_service(&mut self) {
+        if !camera::primary_camera_exists() {
+            return;
+        }
+        let primary_camera_name =
+            video_service::get_service_name(VideoSource::Camera, camera::PRIMARY_CAMERA_IDX);
+        if !self.contains(&primary_camera_name) {
+            self.add_service(Box::new(video_service::new(
+                VideoSource::Camera,
+                camera::PRIMARY_CAMERA_IDX,
+            )));
+        }
     }
 
     pub fn try_add_primay_video_service(&mut self) {
-        let primary_video_service_name =
-            video_service::get_service_name(*display_service::PRIMARY_DISPLAY_IDX);
+        let primary_video_service_name = video_service::get_service_name(
+            VideoSource::Monitor,
+            *display_service::PRIMARY_DISPLAY_IDX,
+        );
         if !self.contains(&primary_video_service_name) {
             self.add_service(Box::new(video_service::new(
+                VideoSource::Monitor,
                 *display_service::PRIMARY_DISPLAY_IDX,
             )));
         }
     }
 
+    pub fn add_camera_connection(&mut self, conn: ConnInner) {
+        if camera::primary_camera_exists() {
+            let primary_camera_name =
+                video_service::get_service_name(VideoSource::Camera, camera::PRIMARY_CAMERA_IDX);
+            if let Some(s) = self.services.get(&primary_camera_name) {
+                s.on_subscribe(conn.clone());
+            }
+        }
+        self.connections.insert(conn.id(), conn);
+    }
+
     pub fn add_connection(&mut self, conn: ConnInner, noperms: &Vec<&'static str>) {
-        let primary_video_service_name =
-            video_service::get_service_name(*display_service::PRIMARY_DISPLAY_IDX);
+        let primary_video_service_name = video_service::get_service_name(
+            VideoSource::Monitor,
+            *display_service::PRIMARY_DISPLAY_IDX,
+        );
         for s in self.services.values() {
             let name = s.name();
             if Self::is_video_service_name(&name) && name != primary_video_service_name {
@@ -301,7 +359,6 @@ impl Server {
         #[cfg(target_os = "macos")]
         self.update_enable_retina();
         self.connections.insert(conn.id(), conn);
-        *CONN_COUNT.lock().unwrap() = self.connections.len();
     }
 
     pub fn remove_connection(&mut self, conn: &ConnInner) {
@@ -309,7 +366,6 @@ impl Server {
             s.on_unsubscribe(conn.id());
         }
         self.connections.remove(&conn.id());
-        *CONN_COUNT.lock().unwrap() = self.connections.len();
         #[cfg(target_os = "macos")]
         self.update_enable_retina();
     }
@@ -355,10 +411,15 @@ impl Server {
         self.id_count
     }
 
-    pub fn set_video_service_opt(&self, display: Option<usize>, opt: &str, value: &str) {
+    pub fn set_video_service_opt(
+        &self,
+        display: Option<(VideoSource, usize)>,
+        opt: &str,
+        value: &str,
+    ) {
         for (k, v) in self.services.iter() {
-            if let Some(display) = display {
-                if k != &video_service::get_service_name(display) {
+            if let Some((source, display)) = display {
+                if k != &video_service::get_service_name(source, display) {
                     continue;
                 }
             }
@@ -386,13 +447,14 @@ impl Server {
     fn capture_displays(
         &mut self,
         conn: ConnInner,
+        source: VideoSource,
         displays: &[usize],
         include: bool,
         exclude: bool,
     ) {
         let displays = displays
             .iter()
-            .map(|d| video_service::get_service_name(*d))
+            .map(|d| video_service::get_service_name(source, *d))
             .collect::<Vec<_>>();
         let keys = self.services.keys().cloned().collect::<Vec<_>>();
         for name in keys.iter() {

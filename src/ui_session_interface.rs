@@ -20,7 +20,7 @@ use uuid::Uuid;
 use hbb_common::fs;
 use hbb_common::{
     allow_err,
-    config::{Config, LocalConfig, PeerConfig},
+    config::{keys, Config, LocalConfig, PeerConfig},
     get_version_number, log,
     message_proto::*,
     rendezvous_proto::ConnType,
@@ -29,7 +29,7 @@ use hbb_common::{
         sync::mpsc,
         time::{Duration as TokioDuration, Instant},
     },
-    Stream,
+    whoami, Stream,
 };
 
 use crate::client::io_loop::Remote;
@@ -58,6 +58,7 @@ pub struct Session<T: InvokeUiSession> {
     pub server_clipboard_enabled: Arc<RwLock<bool>>,
     pub last_change_display: Arc<Mutex<ChangeDisplayRecord>>,
     pub connection_round_state: Arc<Mutex<ConnectionRoundState>>,
+    pub printer_names: Arc<RwLock<HashMap<i32, String>>>,
 }
 
 #[derive(Clone)]
@@ -162,6 +163,13 @@ impl SessionPermissionConfig {
             && *self.server_keyboard_enabled.read().unwrap()
             && !self.lc.read().unwrap().disable_clipboard.v
     }
+
+    #[cfg(feature = "unix-file-copy-paste")]
+    pub fn is_file_clipboard_required(&self) -> bool {
+        *self.server_keyboard_enabled.read().unwrap()
+            && *self.server_file_transfer_enabled.read().unwrap()
+            && self.lc.read().unwrap().enable_file_copy_paste.v
+    }
 }
 
 impl<T: InvokeUiSession> Session<T> {
@@ -181,6 +189,18 @@ impl<T: InvokeUiSession> Session<T> {
             .unwrap()
             .conn_type
             .eq(&ConnType::FILE_TRANSFER)
+    }
+
+    pub fn is_default(&self) -> bool {
+        self.lc.read().unwrap().conn_type.eq(&ConnType::DEFAULT_CONN)
+    }
+
+    pub fn is_view_camera(&self) -> bool {
+        self.lc.read().unwrap().conn_type.eq(&ConnType::VIEW_CAMERA)
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        self.lc.read().unwrap().conn_type.eq(&ConnType::TERMINAL)
     }
 
     pub fn is_port_forward(&self) -> bool {
@@ -216,6 +236,10 @@ impl<T: InvokeUiSession> Session<T> {
 
     pub fn get_peer_version(&self) -> i64 {
         self.lc.read().unwrap().version.clone()
+    }
+
+    pub fn get_trackpad_speed(&self) -> i32 {
+        self.lc.read().unwrap().trackpad_speed
     }
 
     pub fn fallback_keyboard_mode(&self) -> String {
@@ -324,8 +348,8 @@ impl<T: InvokeUiSession> Session<T> {
 
     pub fn toggle_option(&self, name: String) {
         let msg = self.lc.write().unwrap().toggle_option(name.clone());
-        #[cfg(not(feature = "flutter"))]
-        if name == hbb_common::config::keys::OPTION_ENABLE_FILE_COPY_PASTE {
+        #[cfg(all(target_os = "windows", not(feature = "flutter")))]
+        if name == keys::OPTION_ENABLE_FILE_COPY_PASTE {
             self.send(Data::ToggleClipboardFile);
         }
         if let Some(msg) = msg {
@@ -361,6 +385,13 @@ impl<T: InvokeUiSession> Session<T> {
             && !self.lc.read().unwrap().disable_clipboard.v
     }
 
+    #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
+    pub fn is_file_clipboard_required(&self) -> bool {
+        *self.server_keyboard_enabled.read().unwrap()
+            && *self.server_file_transfer_enabled.read().unwrap()
+            && self.lc.read().unwrap().enable_file_copy_paste.v
+    }
+
     #[cfg(feature = "flutter")]
     pub fn refresh_video(&self, display: i32) {
         if crate::common::is_support_multi_ui_session_num(self.lc.read().unwrap().version) {
@@ -393,6 +424,14 @@ impl<T: InvokeUiSession> Session<T> {
         self.send(Data::RecordScreen(start));
     }
 
+    pub fn is_screenshot_supported(&self) -> bool {
+        crate::common::is_support_screenshot_num(self.lc.read().unwrap().version)
+    }
+
+    pub fn take_screenshot(&self, display: i32, sid: String) {
+        self.send(Data::TakeScreenshot((display, sid)));
+    }
+
     pub fn is_recording(&self) -> bool {
         self.lc.read().unwrap().record_state
     }
@@ -419,6 +458,10 @@ impl<T: InvokeUiSession> Session<T> {
                 self.send(Data::Message(msg));
             }
         }
+    }
+
+    pub fn save_trackpad_speed(&self, trackpad_speed: i32) {
+        self.lc.write().unwrap().save_trackpad_speed(trackpad_speed);
     }
 
     pub fn set_custom_fps(&self, custom_fps: i32) {
@@ -470,14 +513,14 @@ impl<T: InvokeUiSession> Session<T> {
         (vp8, av1, h264, h265)
     }
 
-    pub fn change_prefer_codec(&self) {
+    pub fn update_supported_decodings(&self) {
         let msg = self.lc.write().unwrap().update_supported_decodings();
         self.send(Data::Message(msg));
     }
 
     pub fn use_texture_render_changed(&self) {
         self.send(Data::ResetDecoder(None));
-        self.change_prefer_codec();
+        self.update_supported_decodings();
         self.send(Data::Message(LoginConfigHandler::refresh()));
     }
 
@@ -710,6 +753,57 @@ impl<T: InvokeUiSession> Session<T> {
         msg_out.set_misc(misc);
         self.send(Data::Message(msg_out));
     }
+
+    // Terminal methods
+    pub fn open_terminal(&self, terminal_id: i32, rows: u32, cols: u32) {
+        let mut action = TerminalAction::new();
+        action.set_open(OpenTerminal {
+            terminal_id,
+            rows,
+            cols,
+            ..Default::default()
+        });
+        let mut msg_out = Message::new();
+        msg_out.set_terminal_action(action);
+        self.send(Data::Message(msg_out));
+    }
+
+    pub fn send_terminal_input(&self, terminal_id: i32, data: String) {
+        let mut action = TerminalAction::new();
+        action.set_data(TerminalData {
+            terminal_id,
+            data: bytes::Bytes::from(data.into_bytes()),
+            ..Default::default()
+        });
+        let mut msg_out = Message::new();
+        msg_out.set_terminal_action(action);
+        self.send(Data::Message(msg_out));
+    }
+
+    pub fn resize_terminal(&self, terminal_id: i32, rows: u32, cols: u32) {
+        let mut action = TerminalAction::new();
+        action.set_resize(ResizeTerminal {
+            terminal_id,
+            rows,
+            cols,
+            ..Default::default()
+        });
+        let mut msg_out = Message::new();
+        msg_out.set_terminal_action(action);
+        self.send(Data::Message(msg_out));
+    }
+
+    pub fn close_terminal(&self, terminal_id: i32) {
+        let mut action = TerminalAction::new();
+        action.set_close(CloseTerminal {
+            terminal_id,
+            ..Default::default()
+        });
+        let mut msg_out = Message::new();
+        msg_out.set_terminal_action(action);
+        self.send(Data::Message(msg_out));
+    }
+
 
     pub fn capture_displays(&self, add: Vec<i32>, sub: Vec<i32>, set: Vec<i32>) {
         let mut misc = Misc::new();
@@ -1389,9 +1483,10 @@ impl<T: InvokeUiSession> Session<T> {
 
     #[inline]
     fn try_change_init_resolution(&self, display: i32) {
-        if let Some((w, h)) = self.lc.read().unwrap().get_custom_resolution(display) {
-            self.change_resolution(display, w, h);
-        }
+        let Some((w, h)) = self.lc.read().unwrap().get_custom_resolution(display) else {
+            return;
+        };
+        self.change_resolution(display, w, h);
     }
 
     fn do_change_resolution(&self, display: i32, width: i32, height: i32) {
@@ -1452,7 +1547,7 @@ impl<T: InvokeUiSession> Session<T> {
                                 self.read_remote_dir(remote_dir, show_hidden);
                             }
                         }
-                    } else {
+                    } else if !self.is_terminal() {
                         self.msgbox(
                             "success",
                             "Successful",
@@ -1485,6 +1580,20 @@ impl<T: InvokeUiSession> Session<T> {
 
     pub fn get_conn_token(&self) -> Option<String> {
         self.lc.read().unwrap().get_conn_token()
+    }
+
+    pub fn printer_response(&self, id: i32, path: String, printer_name: String) {
+        self.printer_names.write().unwrap().insert(id, printer_name);
+        let to = std::env::temp_dir().join(format!("rustdesk_printer_{id}"));
+        self.send(Data::SendFiles((
+            id,
+            hbb_common::fs::JobType::Printer,
+            path,
+            to.to_string_lossy().to_string(),
+            0,
+            false,
+            true,
+        )));
     }
 }
 
@@ -1551,6 +1660,9 @@ pub trait InvokeUiSession: Send + Sync + Clone + 'static + Sized + Default {
     fn is_multi_ui_session(&self) -> bool;
     fn update_record_status(&self, start: bool);
     fn update_empty_dirs(&self, _res: ReadEmptyDirsResponse) {}
+    fn printer_request(&self, id: i32, path: String);
+    fn handle_screenshot_resp(&self, sid: String, msg: String);
+    fn handle_terminal_response(&self, response: TerminalResponse);
 }
 
 impl<T: InvokeUiSession> Deref for Session<T> {
@@ -1611,11 +1723,16 @@ impl<T: InvokeUiSession> Interface for Session<T> {
                 self.on_error("No active console user logged on, please connect and logon first.");
                 return;
             }
-        } else if !self.is_port_forward() {
+        } else if !self.is_port_forward() && !self.is_terminal() {
             if pi.displays.is_empty() {
                 self.lc.write().unwrap().handle_peer_info(&pi);
                 self.update_privacy_mode();
-                self.msgbox("error", "Remote Error", "No Displays", "");
+                let msg = if self.is_view_camera() {
+                    "No cameras"
+                } else {
+                    "No displays"
+                };
+                self.msgbox("error", "Error", msg, "");
                 return;
             }
             self.try_change_init_resolution(pi.current_display);
@@ -1638,7 +1755,7 @@ impl<T: InvokeUiSession> Interface for Session<T> {
         self.set_peer_info(&pi);
         if self.is_file_transfer() {
             self.close_success();
-        } else if !self.is_port_forward() {
+        } else if !self.is_port_forward() && !self.is_terminal() {
             self.msgbox(
                 "success",
                 "Successful",

@@ -488,8 +488,10 @@ abstract class BasePeerCard extends StatelessWidget {
     BuildContext context,
     String title, {
     bool isFileTransfer = false,
+    bool isViewCamera = false,
     bool isTcpTunneling = false,
     bool isRDP = false,
+    bool isTerminal = false,
   }) {
     return MenuEntryButton<String>(
       childBuilder: (TextStyle? style) => Text(
@@ -502,8 +504,10 @@ abstract class BasePeerCard extends StatelessWidget {
           peer,
           tab,
           isFileTransfer: isFileTransfer,
+          isViewCamera: isViewCamera,
           isTcpTunneling: isTcpTunneling,
           isRDP: isRDP,
+          isTerminal: isTerminal,
         );
       },
       padding: menuPadding,
@@ -527,6 +531,24 @@ abstract class BasePeerCard extends StatelessWidget {
       context,
       translate('Transfer file'),
       isFileTransfer: true,
+    );
+  }
+
+  @protected
+  MenuEntryBase<String> _viewCameraAction(BuildContext context) {
+    return _connectCommonAction(
+      context,
+      translate('View camera'),
+      isViewCamera: true,
+    );
+  }
+
+  @protected
+  MenuEntryBase<String> _terminalAction(BuildContext context) {
+    return _connectCommonAction(
+      context,
+      translate('Terminal'),
+      isTerminal: true,
     );
   }
 
@@ -716,18 +738,18 @@ abstract class BasePeerCard extends StatelessWidget {
           switch (tab) {
             case PeerTabIndex.recent:
               await bind.mainRemovePeer(id: id);
-              await bind.mainLoadRecentPeers();
+              bind.mainLoadRecentPeers();
               break;
             case PeerTabIndex.fav:
               final favs = (await bind.mainGetFav()).toList();
               if (favs.remove(id)) {
                 await bind.mainStoreFav(favs: favs);
-                await bind.mainLoadFavPeers();
+                bind.mainLoadFavPeers();
               }
               break;
             case PeerTabIndex.lan:
               await bind.mainRemoveDiscovered(id: id);
-              await bind.mainLoadLanPeers();
+              bind.mainLoadLanPeers();
               break;
             case PeerTabIndex.ab:
               await gFFI.abModel.deletePeers([id]);
@@ -880,6 +902,8 @@ class RecentPeerCard extends BasePeerCard {
     final List<MenuEntryBase<String>> menuItems = [
       _connectAction(context),
       _transferFileAction(context),
+      _viewCameraAction(context),
+      _terminalAction(context),
     ];
 
     final List favs = (await bind.mainGetFav()).toList();
@@ -939,6 +963,8 @@ class FavoritePeerCard extends BasePeerCard {
     final List<MenuEntryBase<String>> menuItems = [
       _connectAction(context),
       _transferFileAction(context),
+      _viewCameraAction(context),
+      _terminalAction(context),
     ];
     if (isDesktop && peer.platform != kPeerPlatformAndroid) {
       menuItems.add(_tcpTunnelingAction(context));
@@ -992,6 +1018,8 @@ class DiscoveredPeerCard extends BasePeerCard {
     final List<MenuEntryBase<String>> menuItems = [
       _connectAction(context),
       _transferFileAction(context),
+      _viewCameraAction(context),
+      _terminalAction(context),
     ];
 
     final List favs = (await bind.mainGetFav()).toList();
@@ -1045,12 +1073,16 @@ class AddressBookPeerCard extends BasePeerCard {
     final List<MenuEntryBase<String>> menuItems = [
       _connectAction(context),
       _transferFileAction(context),
+      _viewCameraAction(context),
+      _terminalAction(context),
     ];
     if (isDesktop && peer.platform != kPeerPlatformAndroid) {
       menuItems.add(_tcpTunnelingAction(context));
     }
     // menuItems.add(await _openNewConnInOptAction(peer.id));
-    // menuItems.add(await _forceAlwaysRelayAction(peer.id));
+    if (!isWeb) {
+      menuItems.add(await _forceAlwaysRelayAction(peer.id));
+    }
     if (isWindows && peer.platform == kPeerPlatformWindows) {
       menuItems.add(_rdpAction(context, peer.id));
     }
@@ -1177,12 +1209,16 @@ class MyGroupPeerCard extends BasePeerCard {
     final List<MenuEntryBase<String>> menuItems = [
       _connectAction(context),
       _transferFileAction(context),
+      _viewCameraAction(context),
+      _terminalAction(context),
     ];
     if (isDesktop && peer.platform != kPeerPlatformAndroid) {
       menuItems.add(_tcpTunnelingAction(context));
     }
     // menuItems.add(await _openNewConnInOptAction(peer.id));
-    // menuItems.add(await _forceAlwaysRelayAction(peer.id));
+    if (!isWeb) {
+      menuItems.add(await _forceAlwaysRelayAction(peer.id));
+    }
     if (isWindows && peer.platform == kPeerPlatformWindows) {
       menuItems.add(_rdpAction(context, peer.id));
     }
@@ -1398,8 +1434,10 @@ class TagPainter extends CustomPainter {
 
 void connectInPeerTab(BuildContext context, Peer peer, PeerTabIndex tab,
     {bool isFileTransfer = false,
+    bool isViewCamera = false,
     bool isTcpTunneling = false,
-    bool isRDP = false}) async {
+    bool isRDP = false,
+    bool isTerminal = false}) async {
   var password = '';
   bool isSharedPassword = false;
   if (tab == PeerTabIndex.ab) {
@@ -1423,6 +1461,8 @@ void connectInPeerTab(BuildContext context, Peer peer, PeerTabIndex tab,
       password: password,
       isSharedPassword: isSharedPassword,
       isFileTransfer: isFileTransfer,
+      isTerminal: isTerminal,
+      isViewCamera: isViewCamera,
       isTcpTunneling: isTcpTunneling,
       isRDP: isRDP);
 }

@@ -1,7 +1,9 @@
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+use crate::clipboard::clipboard_listener;
 use async_trait::async_trait;
 use bytes::Bytes;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
-use clipboard_master::{CallbackResult, ClipboardHandler};
+use clipboard_master::CallbackResult;
 #[cfg(not(target_os = "linux"))]
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
@@ -12,21 +14,30 @@ use magnum_opus::{Channels::*, Decoder as AudioDecoder};
 #[cfg(not(target_os = "linux"))]
 use ringbuf::{ring_buffer::RbBase, Rb};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     ffi::c_void,
-    io,
     net::SocketAddr,
     ops::Deref,
     str::FromStr,
     sync::{
-        mpsc::{self, RecvTimeoutError, Sender},
+        mpsc::{self, RecvTimeoutError},
         Arc, Mutex, RwLock,
     },
 };
 use uuid::Uuid;
 
+use crate::{
+    check_port,
+    common::input::{MOUSE_BUTTON_LEFT, MOUSE_BUTTON_RIGHT, MOUSE_TYPE_DOWN, MOUSE_TYPE_UP},
+    create_symmetric_key_msg, decode_id_pk, get_rs_pk, is_keyboard_mode_supported,
+    kcp_stream::KcpStream,
+    secure_tcp,
+    ui_interface::{get_builtin_option, use_texture_render},
+    ui_session_interface::{InvokeUiSession, Session},
+};
+#[cfg(feature = "unix-file-copy-paste")]
+use crate::{clipboard::check_clipboard_files, clipboard_file::unix_file_clip};
 pub use file_trait::FileManager;
 #[cfg(not(feature = "flutter"))]
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -36,41 +47,36 @@ use hbb_common::{
     anyhow::{anyhow, Context},
     bail,
     config::{
-        self, Config, LocalConfig, PeerConfig, PeerInfoSerde, Resolution, CONNECT_TIMEOUT,
-        PUBLIC_RS_PUB_KEY, READ_TIMEOUT, RELAY_PORT, RENDEZVOUS_PORT, RENDEZVOUS_SERVERS,
+        self, keys, use_ws, Config, LocalConfig, PeerConfig, PeerInfoSerde, Resolution,
+        CONNECT_TIMEOUT, READ_TIMEOUT, RELAY_PORT, RENDEZVOUS_PORT, RENDEZVOUS_SERVERS,
     },
+    fs::JobType,
+    futures::future::{select_ok, FutureExt},
     get_version_number, log,
     message_proto::{option_message::BoolOption, *},
     protobuf::{Message as _, MessageField},
     rand,
     rendezvous_proto::*,
-    socket_client::{connect_tcp, connect_tcp_local, ipv4_to_ipv6},
+    sha2::{Digest, Sha256},
+    socket_client::{connect_tcp, connect_tcp_local, ipv4_to_ipv6, new_direct_udp_for},
     sodiumoxide::{base64, crypto::sign},
-    tcp::FramedStream,
     timeout,
     tokio::{
         self,
+        net::UdpSocket,
+        sync::{
+            mpsc::{unbounded_channel, UnboundedReceiver},
+            oneshot,
+        },
         time::{interval, Duration, Instant},
     },
     AddrMangle, ResultType, Stream,
-};
-use hbb_common::{
-    config::keys::OPTION_ALLOW_AUTO_RECORD_OUTGOING,
-    tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver},
 };
 pub use helper::*;
 use scrap::{
     codec::Decoder,
     record::{Recorder, RecorderContext},
     CodecFormat, ImageFormat, ImageRgb, ImageTexture,
-};
-
-use crate::{
-    check_port,
-    common::input::{MOUSE_BUTTON_LEFT, MOUSE_BUTTON_RIGHT, MOUSE_TYPE_DOWN, MOUSE_TYPE_UP},
-    create_symmetric_key_msg, decode_id_pk, get_rs_pk, is_keyboard_mode_supported, secure_tcp,
-    ui_interface::{get_builtin_option, use_texture_render},
-    ui_session_interface::{InvokeUiSession, Session},
 };
 
 #[cfg(not(target_os = "ios"))]
@@ -86,6 +92,7 @@ pub use super::lang::*;
 pub mod file_trait;
 pub mod helper;
 pub mod io_loop;
+pub mod screenshot;
 
 pub const MILLI1: Duration = Duration::from_millis(1);
 pub const SEC30: Duration = Duration::from_secs(30);
@@ -131,14 +138,19 @@ pub(crate) struct ClientClipboardContext;
 pub(crate) struct ClientClipboardContext {
     pub cfg: SessionPermissionConfig,
     pub tx: UnboundedSender<Data>,
+    #[cfg(feature = "unix-file-copy-paste")]
+    pub is_file_supported: bool,
 }
 
 /// Client of the remote desktop.
 pub struct Client;
 
 #[cfg(not(target_os = "ios"))]
-struct TextClipboardState {
-    is_required: bool,
+struct ClipboardState {
+    #[cfg(feature = "flutter")]
+    is_text_required: bool,
+    #[cfg(all(feature = "flutter", feature = "unix-file-copy-paste"))]
+    is_file_required: bool,
     running: bool,
 }
 
@@ -154,7 +166,7 @@ lazy_static::lazy_static! {
 
 #[cfg(not(target_os = "ios"))]
 lazy_static::lazy_static! {
-    static ref TEXT_CLIPBOARD_STATE: Arc<Mutex<TextClipboardState>> = Arc::new(Mutex::new(TextClipboardState::new()));
+    static ref CLIPBOARD_STATE: Arc<Mutex<ClipboardState>> = Arc::new(Mutex::new(ClipboardState::new()));
 }
 
 const PUBLIC_SERVER: &str = "public";
@@ -170,6 +182,8 @@ pub fn get_key_state(key: enigo::Key) -> bool {
 }
 
 impl Client {
+    const CLIENT_CLIPBOARD_NAME: &'static str = "client-clipboard";
+
     /// Start a new connection.
     pub async fn start(
         peer: &str,
@@ -177,7 +191,10 @@ impl Client {
         token: &str,
         conn_type: ConnType,
         interface: impl Interface,
-    ) -> ResultType<((Stream, bool, Option<Vec<u8>>), (i32, String))> {
+    ) -> ResultType<(
+        (Stream, bool, Option<Vec<u8>>, Option<KcpStream>),
+        (i32, String),
+    )> {
         debug_assert!(peer == interface.get_id());
         interface.update_direct(None);
         interface.update_received(false);
@@ -201,7 +218,10 @@ impl Client {
         token: &str,
         conn_type: ConnType,
         interface: impl Interface,
-    ) -> ResultType<((Stream, bool, Option<Vec<u8>>), (i32, String))> {
+    ) -> ResultType<(
+        (Stream, bool, Option<Vec<u8>>, Option<KcpStream>),
+        (i32, String),
+    )> {
         if config::is_incoming_only() {
             bail!("Incoming only mode");
         }
@@ -209,8 +229,10 @@ impl Client {
         if hbb_common::is_ip_str(peer) {
             return Ok((
                 (
-                    connect_tcp(check_port(peer, RELAY_PORT + 1), CONNECT_TIMEOUT).await?,
+                    connect_tcp_local(check_port(peer, RELAY_PORT + 1), None, CONNECT_TIMEOUT)
+                        .await?,
                     true,
+                    None,
                     None,
                 ),
                 (0, "".to_owned()),
@@ -219,7 +241,12 @@ impl Client {
         // Allow connect to {domain}:{port}
         if hbb_common::is_domain_port_str(peer) {
             return Ok((
-                (connect_tcp(peer, CONNECT_TIMEOUT).await?, true, None),
+                (
+                    connect_tcp_local(peer, None, CONNECT_TIMEOUT).await?,
+                    true,
+                    None,
+                    None,
+                ),
                 (0, "".to_owned()),
             ));
         }
@@ -247,8 +274,35 @@ impl Client {
             }
         };
 
+        if crate::get_ipv6_punch_enabled() {
+            crate::test_ipv6().await;
+        }
+
+        let (stop_udp_tx, stop_udp_rx) = oneshot::channel::<()>();
+        let mut udp =
+        // no need to care about multiple rendezvous servers case, since it is acutally not used any more.
+        // Shared state for UDP NAT test result
+        if crate::get_udp_punch_enabled() {
+            if let Ok((socket, addr)) = new_direct_udp_for(&rendezvous_server).await {
+                let udp_port = Arc::new(Mutex::new(0));
+                let up_cloned = udp_port.clone();
+                let socket_cloned = socket.clone();
+                let func = async move {
+                    allow_err!(test_udp_uat(socket_cloned, addr, up_cloned, stop_udp_rx).await);
+                };
+                tokio::spawn(func);
+                (Some(socket), Some(udp_port))
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        };
+        let mut start = Instant::now();
         let mut socket = connect_tcp(&*rendezvous_server, CONNECT_TIMEOUT).await;
         debug_assert!(!servers.contains(&rendezvous_server));
+        let rtt = start.elapsed();
+        log::debug!("TCP connection establishment time used: {:?}", rtt);
         if socket.is_err() && !servers.is_empty() {
             log::info!("try the other servers: {:?}", servers);
             for server in servers {
@@ -268,40 +322,69 @@ impl Client {
         let my_addr = socket.local_addr();
         let mut signed_id_pk = Vec::new();
         let mut relay_server = "".to_owned();
-
-        if !key.is_empty() && !token.is_empty() {
-            // mainly for the security of token
-            allow_err!(secure_tcp(&mut socket, key).await);
-        }
-
-        let start = std::time::Instant::now();
         let mut peer_addr = Config::get_any_listen_addr(true);
         let mut peer_nat_type = NatType::UNKNOWN_NAT;
         let my_nat_type = crate::get_nat_type(100).await;
         let mut is_local = false;
         let mut feedback = 0;
+        let force_relay = interface.is_force_relay() || use_ws() || Config::is_proxy();
+        use hbb_common::protobuf::Enum;
+        let nat_type = if force_relay {
+            NatType::SYMMETRIC
+        } else {
+            NatType::from_i32(my_nat_type).unwrap_or(NatType::UNKNOWN_NAT)
+        };
+
+        if !key.is_empty() && !token.is_empty() {
+            // mainly for the security of token
+            secure_tcp(&mut socket, key)
+                .await
+                .map_err(|e| anyhow!("Failed to secure tcp: {}", e))?;
+        } else if let Some(udp) = udp.1.as_ref() {
+            let tm = Instant::now();
+            loop {
+                let port = *udp.lock().unwrap();
+                if port > 0 {
+                    break;
+                }
+                // await for 0.5 RTT
+                if tm.elapsed() > rtt / 2 {
+                    break;
+                }
+                hbb_common::sleep(0.001).await;
+            }
+        }
+        // Stop UDP NAT test task if still running
+        let _ = stop_udp_tx.send(());
+        let mut msg_out = RendezvousMessage::new();
+        let mut ipv6 = if crate::get_ipv6_punch_enabled() {
+            if let Some((socket, addr)) = crate::get_ipv6_socket().await {
+                (Some(socket), Some(addr))
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        };
+        let udp_nat_port = udp.1.map(|x| *x.lock().unwrap()).unwrap_or(0);
+        msg_out.set_punch_hole_request(PunchHoleRequest {
+            id: peer.to_owned(),
+            token: token.to_owned(),
+            nat_type: nat_type.into(),
+            licence_key: key.to_owned(),
+            conn_type: conn_type.into(),
+            version: crate::VERSION.to_owned(),
+            udp_port: udp_nat_port as _,
+            force_relay,
+            socket_addr_v6: ipv6.1.unwrap_or_default(),
+            ..Default::default()
+        });
         for i in 1..=3 {
             log::info!("#{} punch attempt with {}, id: {}", i, my_addr, peer);
-            let mut msg_out = RendezvousMessage::new();
-            use hbb_common::protobuf::Enum;
-            let nat_type = if interface.is_force_relay() {
-                NatType::SYMMETRIC
-            } else {
-                NatType::from_i32(my_nat_type).unwrap_or(NatType::UNKNOWN_NAT)
-            };
-            msg_out.set_punch_hole_request(PunchHoleRequest {
-                id: peer.to_owned(),
-                token: token.to_owned(),
-                nat_type: nat_type.into(),
-                licence_key: key.to_owned(),
-                conn_type: conn_type.into(),
-                version: crate::VERSION.to_owned(),
-                ..Default::default()
-            });
             socket.send(&msg_out).await?;
             // below timeout should not bigger than hbbs's connection timeout.
             if let Some(msg_in) =
-                crate::get_next_nonkeyexchange_msg(&mut socket, Some(i * 6000)).await
+                crate::get_next_nonkeyexchange_msg(&mut socket, Some(i * 3000)).await
             {
                 match msg_in.union {
                     Some(rendezvous_message::Union::PunchHoleResponse(ph)) => {
@@ -331,6 +414,23 @@ impl Client {
                             relay_server = ph.relay_server;
                             peer_addr = AddrMangle::decode(&ph.socket_addr);
                             feedback = ph.feedback;
+                            let s = udp.0.take();
+                            if ph.is_udp && s.is_some() {
+                                if let Some(s) = s {
+                                    allow_err!(s.connect(peer_addr).await);
+                                    udp.0 = Some(s);
+                                }
+                            }
+                            let s = ipv6.0.take();
+                            if !ph.socket_addr_v6.is_empty() && s.is_some() {
+                                let addr = AddrMangle::decode(&ph.socket_addr_v6);
+                                if addr.port() > 0 {
+                                    if let Some(s) = s {
+                                        allow_err!(s.connect(addr).await);
+                                        ipv6.0 = Some(s);
+                                    }
+                                }
+                            }
                             log::info!("Hole Punched {} = {}", peer, peer_addr);
                             break;
                         }
@@ -341,20 +441,44 @@ impl Client {
                             start.elapsed(),
                             rr.relay_server
                         );
+                        start = Instant::now();
+                        let mut connect_futures = Vec::new();
+                        if let Some(s) = ipv6.0 {
+                            let addr = AddrMangle::decode(&rr.socket_addr_v6);
+                            if addr.port() > 0 {
+                                if s.connect(addr).await.is_ok() {
+                                    connect_futures.push(udp_nat_connect(s, "IPv6").boxed());
+                                }
+                            }
+                        }
                         signed_id_pk = rr.pk().into();
-                        let mut conn = Self::create_relay(
+                        let fut = Self::create_relay(
                             peer,
                             rr.uuid,
                             rr.relay_server,
                             key,
                             conn_type,
                             my_addr.is_ipv4(),
-                        )
-                        .await?;
+                        );
+                        connect_futures.push(
+                            async move {
+                                let conn = fut.await?;
+                                Ok((conn, None, "Relay"))
+                            }
+                            .boxed(),
+                        );
+                        // Run all connection attempts concurrently, return the first successful one
+                        let (conn, kcp, typ) = match select_ok(connect_futures).await {
+                            Ok(conn) => (Ok(conn.0 .0), conn.0 .1, conn.0 .2),
+
+                            Err(e) => (Err(e), None, ""),
+                        };
+                        let mut conn = conn?;
                         feedback = rr.feedback;
+                        log::info!("{:?} used to establish {typ} connection", start.elapsed());
                         let pk =
                             Self::secure_connection(peer, signed_id_pk, key, &mut conn).await?;
-                        return Ok(((conn, false, pk), (feedback, rendezvous_server)));
+                        return Ok(((conn, false, pk, kcp), (feedback, rendezvous_server)));
                     }
                     _ => {
                         log::error!("Unexpected protobuf msg received: {:?}", msg_in);
@@ -393,6 +517,8 @@ impl Client {
                 token,
                 conn_type,
                 interface,
+                udp.0,
+                ipv6.0,
             )
             .await?,
             (feedback, rendezvous_server),
@@ -415,7 +541,9 @@ impl Client {
         token: &str,
         conn_type: ConnType,
         interface: impl Interface,
-    ) -> ResultType<(Stream, bool, Option<Vec<u8>>)> {
+        udp_socket_nat: Option<Arc<UdpSocket>>,
+        udp_socket_v6: Option<Arc<UdpSocket>>,
+    ) -> ResultType<(Stream, bool, Option<Vec<u8>>, Option<KcpStream>)> {
         let direct_failures = interface.get_lch().read().unwrap().direct_failures;
         let mut connect_timeout = 0;
         const MIN: u64 = 1000;
@@ -450,8 +578,28 @@ impl Client {
         }
         log::info!("peer address: {}, timeout: {}", peer, connect_timeout);
         let start = std::time::Instant::now();
-        // NOTICE: Socks5 is be used event in intranet. Which may be not a good way.
-        let mut conn = connect_tcp_local(peer, Some(local_addr), connect_timeout).await;
+
+        let mut connect_futures = Vec::new();
+        let fut = connect_tcp_local(peer, Some(local_addr), connect_timeout);
+        connect_futures.push(
+            async move {
+                let conn = fut.await?;
+                Ok((conn, None, "TCP"))
+            }
+            .boxed(),
+        );
+        if let Some(udp_socket_nat) = udp_socket_nat {
+            connect_futures.push(udp_nat_connect(udp_socket_nat, "UDP").boxed());
+        }
+        if let Some(udp_socket_v6) = udp_socket_v6 {
+            connect_futures.push(udp_nat_connect(udp_socket_v6, "IPv6").boxed());
+        }
+        // Run all connection attempts concurrently, return the first successful one
+        let (mut conn, kcp, mut typ) = match select_ok(connect_futures).await {
+            Ok(conn) => (Ok(conn.0 .0), conn.0 .1, conn.0 .2),
+            Err(e) => (Err(e), None, ""),
+        };
+
         let mut direct = !conn.is_err();
         interface.update_direct(Some(direct));
         if interface.is_force_relay() || conn.is_err() {
@@ -470,6 +618,7 @@ impl Client {
                 if let Err(e) = conn {
                     bail!("Failed to connect via relay server: {}", e);
                 }
+                typ = "Relay";
                 direct = false;
             } else {
                 bail!("Failed to make direct connection to remote desktop");
@@ -481,9 +630,9 @@ impl Client {
             interface.get_lch().write().unwrap().set_direct_failure(n);
         }
         let mut conn = conn?;
-        log::info!("{:?} used to establish connection", start.elapsed());
+        log::info!("{:?} used to establish {typ} connection", start.elapsed());
         let pk = Self::secure_connection(peer_id, signed_id_pk, key, &mut conn).await?;
-        Ok((conn, direct, pk))
+        Ok((conn, direct, pk, kcp))
     }
 
     /// Establish secure connection with the server.
@@ -587,7 +736,7 @@ impl Client {
 
             if !key.is_empty() && !token.is_empty() {
                 // mainly for the security of token
-                allow_err!(secure_tcp(&mut socket, key).await);
+                secure_tcp(&mut socket, key).await?;
             }
 
             ipv4 = socket.local_addr().is_ipv4();
@@ -660,7 +809,13 @@ impl Client {
     #[cfg(feature = "flutter")]
     #[cfg(not(target_os = "ios"))]
     pub fn set_is_text_clipboard_required(b: bool) {
-        TEXT_CLIPBOARD_STATE.lock().unwrap().is_required = b;
+        CLIPBOARD_STATE.lock().unwrap().is_text_required = b;
+    }
+
+    #[inline]
+    #[cfg(all(feature = "flutter", feature = "unix-file-copy-paste"))]
+    pub fn set_is_file_clipboard_required(b: bool) {
+        CLIPBOARD_STATE.lock().unwrap().is_file_required = b;
     }
 
     #[cfg(not(target_os = "ios"))]
@@ -676,68 +831,55 @@ impl Client {
         if crate::flutter::sessions::has_sessions_running(ConnType::DEFAULT_CONN) {
             return;
         }
-        TEXT_CLIPBOARD_STATE.lock().unwrap().running = false;
+        #[cfg(not(target_os = "android"))]
+        clipboard_listener::unsubscribe(Self::CLIENT_CLIPBOARD_NAME);
+        CLIPBOARD_STATE.lock().unwrap().running = false;
+        #[cfg(all(feature = "unix-file-copy-paste", target_os = "linux"))]
+        clipboard::platform::unix::fuse::uninit_fuse_context(true);
     }
 
     // `try_start_clipboard` is called by all session when connection is established. (When handling peer info).
     // This function only create one thread with a loop, the loop is shared by all sessions.
     // After all sessions are end, the loop exists.
     //
-    // If clipboard update is detected, the text will be sent to all sessions by `send_text_clipboard_msg`.
+    // If clipboard update is detected, the text will be sent to all sessions by `send_clipboard_msg`.
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn try_start_clipboard(
         _client_clip_ctx: Option<ClientClipboardContext>,
     ) -> Option<UnboundedReceiver<()>> {
-        let mut clipboard_lock = TEXT_CLIPBOARD_STATE.lock().unwrap();
+        let mut clipboard_lock = CLIPBOARD_STATE.lock().unwrap();
         if clipboard_lock.running {
             return None;
         }
 
         let (tx_cb_result, rx_cb_result) = mpsc::channel();
-        let handler = ClientClipboardHandler {
-            ctx: None,
-            tx_cb_result,
-            #[cfg(not(feature = "flutter"))]
-            client_clip_ctx: _client_clip_ctx,
-        };
-
-        let (tx_start_res, rx_start_res) = mpsc::channel();
-        let h = crate::clipboard::start_clipbard_master_thread(handler, tx_start_res);
-        let shutdown = match rx_start_res.recv() {
-            Ok((Some(s), _)) => s,
-            Ok((None, err)) => {
-                log::error!("{}", err);
-                return None;
-            }
-            Err(e) => {
-                log::error!("Failed to create clipboard listener: {}", e);
-                return None;
-            }
-        };
+        if let Err(e) =
+            clipboard_listener::subscribe(Self::CLIENT_CLIPBOARD_NAME.to_owned(), tx_cb_result)
+        {
+            log::error!("Failed to subscribe clipboard listener: {}", e);
+            return None;
+        }
 
         clipboard_lock.running = true;
-
         let (tx_started, rx_started) = unbounded_channel();
 
-        log::info!("Start text clipboard loop");
+        log::info!("Start client clipboard loop");
         std::thread::spawn(move || {
-            let mut is_sent = false;
+            let mut handler = ClientClipboardHandler {
+                ctx: None,
+                #[cfg(not(feature = "flutter"))]
+                client_clip_ctx: _client_clip_ctx,
+            };
 
+            tx_started.send(()).ok();
             loop {
-                if !TEXT_CLIPBOARD_STATE.lock().unwrap().running {
+                if !CLIPBOARD_STATE.lock().unwrap().running {
                     break;
                 }
-                if !TEXT_CLIPBOARD_STATE.lock().unwrap().is_required {
-                    std::thread::sleep(Duration::from_millis(CLIPBOARD_INTERVAL));
-                    continue;
-                }
-
-                if !is_sent {
-                    is_sent = true;
-                    tx_started.send(()).ok();
-                }
-
                 match rx_cb_result.recv_timeout(Duration::from_millis(CLIPBOARD_INTERVAL)) {
+                    Ok(CallbackResult::Next) => {
+                        handler.check_clipboard();
+                    }
                     Ok(CallbackResult::Stop) => {
                         log::debug!("Clipboard listener stopped");
                         break;
@@ -747,13 +889,14 @@ impl Client {
                         break;
                     }
                     Err(RecvTimeoutError::Timeout) => {}
-                    _ => {}
+                    Err(RecvTimeoutError::Disconnected) => {
+                        log::error!("Clipboard listener disconnected");
+                        break;
+                    }
                 }
             }
-            log::info!("Stop text clipboard loop");
-            shutdown.signal();
-            h.join().ok();
-            TEXT_CLIPBOARD_STATE.lock().unwrap().running = false;
+            log::info!("Stop client clipboard loop");
+            CLIPBOARD_STATE.lock().unwrap().running = false;
         });
 
         Some(rx_started)
@@ -761,31 +904,31 @@ impl Client {
 
     #[cfg(target_os = "android")]
     fn try_start_clipboard(_p: Option<()>) -> Option<UnboundedReceiver<()>> {
-        let mut clipboard_lock = TEXT_CLIPBOARD_STATE.lock().unwrap();
+        let mut clipboard_lock = CLIPBOARD_STATE.lock().unwrap();
         if clipboard_lock.running {
             return None;
         }
         clipboard_lock.running = true;
 
-        log::info!("Start text clipboard loop");
+        log::info!("Start client clipboard loop");
         std::thread::spawn(move || {
             loop {
-                if !TEXT_CLIPBOARD_STATE.lock().unwrap().running {
+                if !CLIPBOARD_STATE.lock().unwrap().running {
                     break;
                 }
-                if !TEXT_CLIPBOARD_STATE.lock().unwrap().is_required {
+                if !CLIPBOARD_STATE.lock().unwrap().is_text_required {
                     std::thread::sleep(Duration::from_millis(CLIPBOARD_INTERVAL));
                     continue;
                 }
 
                 if let Some(msg) = crate::clipboard::get_clipboards_msg(true) {
-                    crate::flutter::send_text_clipboard_msg(msg);
+                    crate::flutter::send_clipboard_msg(msg, false);
                 }
 
                 std::thread::sleep(Duration::from_millis(CLIPBOARD_INTERVAL));
             }
-            log::info!("Stop text clipboard loop");
-            TEXT_CLIPBOARD_STATE.lock().unwrap().running = false;
+            log::info!("Stop client clipboard loop");
+            CLIPBOARD_STATE.lock().unwrap().running = false;
         });
 
         None
@@ -793,10 +936,13 @@ impl Client {
 }
 
 #[cfg(not(target_os = "ios"))]
-impl TextClipboardState {
+impl ClipboardState {
     fn new() -> Self {
         Self {
-            is_required: true,
+            #[cfg(feature = "flutter")]
+            is_text_required: true,
+            #[cfg(all(feature = "flutter", feature = "unix-file-copy-paste"))]
+            is_file_required: true,
             running: false,
         }
     }
@@ -805,59 +951,107 @@ impl TextClipboardState {
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 struct ClientClipboardHandler {
     ctx: Option<crate::clipboard::ClipboardContext>,
-    tx_cb_result: Sender<CallbackResult>,
     #[cfg(not(feature = "flutter"))]
     client_clip_ctx: Option<ClientClipboardContext>,
 }
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 impl ClientClipboardHandler {
+    fn is_text_required(&self) -> bool {
+        #[cfg(feature = "flutter")]
+        {
+            CLIPBOARD_STATE.lock().unwrap().is_text_required
+        }
+        #[cfg(not(feature = "flutter"))]
+        {
+            self.client_clip_ctx
+                .as_ref()
+                .map(|ctx| ctx.cfg.is_text_clipboard_required())
+                .unwrap_or(false)
+        }
+    }
+
+    #[cfg(feature = "unix-file-copy-paste")]
+    fn is_file_required(&self) -> bool {
+        #[cfg(feature = "flutter")]
+        {
+            CLIPBOARD_STATE.lock().unwrap().is_file_required
+        }
+        #[cfg(not(feature = "flutter"))]
+        {
+            self.client_clip_ctx
+                .as_ref()
+                .map(|ctx| ctx.cfg.is_file_clipboard_required())
+                .unwrap_or(false)
+        }
+    }
+
+    fn check_clipboard(&mut self) {
+        if CLIPBOARD_STATE.lock().unwrap().running {
+            #[cfg(feature = "unix-file-copy-paste")]
+            if let Some(urls) = check_clipboard_files(&mut self.ctx, ClipboardSide::Client, false) {
+                if !urls.is_empty() {
+                    #[cfg(target_os = "macos")]
+                    if crate::clipboard::is_file_url_set_by_rustdesk(&urls) {
+                        return;
+                    }
+                    if self.is_file_required() {
+                        match clipboard::platform::unix::serv_files::sync_files(&urls) {
+                            Ok(()) => {
+                                let msg = crate::clipboard_file::clip_2_msg(
+                                    unix_file_clip::get_format_list(),
+                                );
+                                self.send_msg(msg, true);
+                            }
+                            Err(e) => {
+                                log::error!("Failed to sync clipboard files: {}", e);
+                            }
+                        }
+                        return;
+                    }
+                }
+            }
+
+            if let Some(msg) = check_clipboard(&mut self.ctx, ClipboardSide::Client, false) {
+                if self.is_text_required() {
+                    self.send_msg(msg, false);
+                }
+            }
+        }
+    }
+
     #[inline]
     #[cfg(feature = "flutter")]
-    fn send_msg(&self, msg: Message) {
-        crate::flutter::send_text_clipboard_msg(msg);
+    fn send_msg(&self, msg: Message, _is_file: bool) {
+        crate::flutter::send_clipboard_msg(msg, _is_file);
     }
 
     #[cfg(not(feature = "flutter"))]
-    fn send_msg(&self, msg: Message) {
+    fn send_msg(&self, msg: Message, _is_file: bool) {
         if let Some(ctx) = &self.client_clip_ctx {
-            if ctx.cfg.is_text_clipboard_required() {
-                if let Some(pi) = ctx.cfg.lc.read().unwrap().peer_info.as_ref() {
-                    if let Some(message::Union::MultiClipboards(multi_clipboards)) = &msg.union {
-                        if let Some(msg_out) = crate::clipboard::get_msg_if_not_support_multi_clip(
-                            &pi.version,
-                            &pi.platform,
-                            multi_clipboards,
-                        ) {
-                            let _ = ctx.tx.send(Data::Message(msg_out));
-                            return;
-                        }
+            #[cfg(feature = "unix-file-copy-paste")]
+            if _is_file {
+                if ctx.is_file_supported {
+                    let _ = ctx.tx.send(Data::Message(msg));
+                }
+                return;
+            }
+
+            let pi = ctx.cfg.lc.read().unwrap().peer_info.clone();
+            if let Some(pi) = pi.as_ref() {
+                if let Some(message::Union::MultiClipboards(multi_clipboards)) = &msg.union {
+                    if let Some(msg_out) = crate::clipboard::get_msg_if_not_support_multi_clip(
+                        &pi.version,
+                        &pi.platform,
+                        multi_clipboards,
+                    ) {
+                        let _ = ctx.tx.send(Data::Message(msg_out));
+                        return;
                     }
                 }
-                let _ = ctx.tx.send(Data::Message(msg));
             }
+            let _ = ctx.tx.send(Data::Message(msg));
         }
-    }
-}
-
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-impl ClipboardHandler for ClientClipboardHandler {
-    fn on_clipboard_change(&mut self) -> CallbackResult {
-        if TEXT_CLIPBOARD_STATE.lock().unwrap().running
-            && TEXT_CLIPBOARD_STATE.lock().unwrap().is_required
-        {
-            if let Some(msg) = check_clipboard(&mut self.ctx, ClipboardSide::Client, false) {
-                self.send_msg(msg);
-            }
-        }
-        CallbackResult::Next
-    }
-
-    fn on_clipboard_error(&mut self, error: io::Error) -> CallbackResult {
-        self.tx_cb_result
-            .send(CallbackResult::StopWithError(error))
-            .ok();
-        CallbackResult::Next
     }
 }
 
@@ -1338,14 +1532,15 @@ impl VideoHandler {
     }
 
     /// Start or stop screen record.
-    pub fn record_screen(&mut self, start: bool, id: String, display: usize) {
+    pub fn record_screen(&mut self, start: bool, id: String, display_idx: usize, camera: bool) {
         self.record = false;
         if start {
             self.recorder = Recorder::new(RecorderContext {
                 server: false,
                 id,
                 dir: crate::ui_interface::video_save_directory(false),
-                display,
+                display_idx,
+                camera,
                 tx: None,
             })
             .map_or(Default::default(), |r| Arc::new(Mutex::new(Some(r))));
@@ -1478,7 +1673,7 @@ impl LoginConfigHandler {
             let server = server_key.next().unwrap_or_default();
             let args = server_key.next().unwrap_or_default();
             let key = if server == PUBLIC_SERVER {
-                PUBLIC_RS_PUB_KEY.to_owned()
+                config::RS_PUB_KEY.to_owned()
             } else {
                 let mut args_map: HashMap<String, &str> = HashMap::new();
                 for arg in args.split('&') {
@@ -1588,6 +1783,9 @@ impl LoginConfigHandler {
     /// * `v` - value of option
     pub fn set_option(&mut self, k: String, v: String) {
         let mut config = self.load_config();
+        if v == self.get_option(&k) {
+            return;
+        }
         config.options.insert(k, v);
         self.save_config(config);
     }
@@ -1756,6 +1954,14 @@ impl LoginConfigHandler {
                 BoolOption::No
             })
             .into();
+        } else if name == keys::OPTION_TERMINAL_PERSISTENT {
+            config.terminal_persistent.v = !config.terminal_persistent.v;
+	    option.terminal_persistent = (if config.terminal_persistent.v {
+                BoolOption::Yes
+            } else {
+                BoolOption::No
+            })
+            .into();
         } else if name == "privacy-mode" {
             // try toggle privacy mode
             option.privacy_mode = (if config.privacy_mode.v {
@@ -1816,6 +2022,12 @@ impl LoginConfigHandler {
             self.config.store(&self.id);
             return None;
         }
+
+        #[cfg(feature = "unix-file-copy-paste")]
+        if option.enable_file_transfer.enum_value() == Ok(BoolOption::No) {
+            crate::clipboard::try_empty_clipboard_files(crate::clipboard::ClipboardSide::Client, 0);
+        }
+
         if !name.contains("block-input") {
             self.save_config(config);
         }
@@ -1847,6 +2059,14 @@ impl LoginConfigHandler {
             return None;
         }
         let mut msg = OptionMessage::new();
+        if self.conn_type.eq(&ConnType::TERMINAL) {
+            if self.get_toggle_option(keys::OPTION_TERMINAL_PERSISTENT) {
+                msg.terminal_persistent = BoolOption::Yes.into();
+                return Some(msg);
+            } else {
+                return None;
+            }
+        }
         let q = self.image_quality.clone();
         if let Some(q) = self.get_image_quality_enum(&q, ignore_default) {
             msg.image_quality = q.into();
@@ -1892,7 +2112,7 @@ impl LoginConfigHandler {
         if self.get_toggle_option("disable-audio") {
             msg.disable_audio = BoolOption::Yes.into();
         }
-        if !view_only && self.get_toggle_option(config::keys::OPTION_ENABLE_FILE_COPY_PASTE) {
+        if !view_only && self.get_toggle_option(keys::OPTION_ENABLE_FILE_COPY_PASTE) {
             msg.enable_file_transfer = BoolOption::Yes.into();
         }
         if view_only || self.get_toggle_option("disable-clipboard") {
@@ -1948,9 +2168,11 @@ impl LoginConfigHandler {
             self.config.show_remote_cursor.v
         } else if name == "lock-after-session-end" {
             self.config.lock_after_session_end.v
+        } else if name == keys::OPTION_TERMINAL_PERSISTENT {
+            self.config.terminal_persistent.v
         } else if name == "privacy-mode" {
             self.config.privacy_mode.v
-        } else if name == config::keys::OPTION_ENABLE_FILE_COPY_PASTE {
+        } else if name == keys::OPTION_ENABLE_FILE_COPY_PASTE {
             self.config.enable_file_copy_paste.v
         } else if name == "disable-audio" {
             self.config.disable_audio.v
@@ -2039,6 +2261,12 @@ impl LoginConfigHandler {
         config.image_quality = value;
         self.save_config(config);
         res
+    }
+
+    pub fn save_trackpad_speed(&mut self, speed: i32) {
+        let mut config = self.load_config();
+        config.trackpad_speed = speed;
+        self.save_config(config);
     }
 
     /// Create a [`Message`] for saving custom fps.
@@ -2244,7 +2472,7 @@ impl LoginConfigHandler {
         } else {
             (my_id, self.id.clone())
         };
-        let mut display_name = get_builtin_option(config::keys::OPTION_DISPLAY_NAME);
+        let mut display_name = get_builtin_option(keys::OPTION_DISPLAY_NAME);
         if display_name.is_empty() {
             display_name =
                 serde_json::from_str::<serde_json::Value>(&LocalConfig::get_option("user_info"))
@@ -2259,8 +2487,24 @@ impl LoginConfigHandler {
         if display_name.is_empty() {
             display_name = crate::username();
         }
+        let display_name = display_name
+            .split_whitespace()
+            .map(|word| {
+                word.chars()
+                    .enumerate()
+                    .map(|(i, c)| {
+                        if i == 0 {
+                            c.to_uppercase().to_string()
+                        } else {
+                            c.to_string()
+                        }
+                    })
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
         #[cfg(not(target_os = "android"))]
-        let my_platform = whoami::platform().to_string();
+        let my_platform = hbb_common::whoami::platform().to_string();
         #[cfg(target_os = "android")]
         let my_platform = "Android".into();
         let hwid = if self.get_option("trust-this-device") == "Y" {
@@ -2292,11 +2536,17 @@ impl LoginConfigHandler {
                 show_hidden: !self.get_option("remote_show_hidden").is_empty(),
                 ..Default::default()
             }),
+            ConnType::VIEW_CAMERA => lr.set_view_camera(Default::default()),
             ConnType::PORT_FORWARD | ConnType::RDP => lr.set_port_forward(PortForward {
                 host: self.port_forward.0.clone(),
                 port: self.port_forward.1,
                 ..Default::default()
             }),
+            ConnType::TERMINAL => {
+                let mut terminal = Terminal::new();
+                terminal.service_id = self.get_option("terminal-service-id");
+                lr.set_terminal(terminal);
+            }
             _ => {}
         }
 
@@ -2341,6 +2591,10 @@ impl LoginConfigHandler {
         })
         .ok()
     }
+
+    pub fn get_id(&self) -> &str {
+        &self.id
+    }
 }
 
 /// Media data.
@@ -2375,6 +2629,7 @@ pub fn start_video_thread<F, T>(
 {
     let mut video_callback = video_callback;
     let mut last_chroma = None;
+    let is_view_camera = session.is_view_camera();
 
     std::thread::spawn(move || {
         #[cfg(windows)]
@@ -2417,7 +2672,7 @@ pub fn start_video_thread<F, T>(
                             let record_permission = session.lc.read().unwrap().record_permission;
                             let id = session.lc.read().unwrap().id.clone();
                             if record_state && record_permission {
-                                handler.record_screen(true, id, display);
+                                handler.record_screen(true, id, display, is_view_camera);
                             }
                             video_handler = Some(handler);
                         }
@@ -2498,7 +2753,7 @@ pub fn start_video_thread<F, T>(
                     MediaData::RecordScreen(start) => {
                         let id = session.lc.read().unwrap().id.clone();
                         if let Some(handler) = video_handler.as_mut() {
-                            handler.record_screen(start, id, display);
+                            handler.record_screen(start, id, display, is_view_camera);
                         }
                     }
                     _ => {}
@@ -3007,8 +3262,7 @@ pub async fn handle_hash(
     }
 
     if password.is_empty() {
-        let p =
-            crate::ui_interface::get_builtin_option(config::keys::OPTION_DEFAULT_CONNECT_PASSWORD);
+        let p = crate::ui_interface::get_builtin_option(keys::OPTION_DEFAULT_CONNECT_PASSWORD);
         if !p.is_empty() {
             let mut hasher = Sha256::new();
             hasher.update(p.clone());
@@ -3233,7 +3487,7 @@ pub enum Data {
     Close,
     Login((String, String, String, bool)),
     Message(Message),
-    SendFiles((i32, String, String, i32, bool, bool)),
+    SendFiles((i32, JobType, String, String, i32, bool, bool)),
     RemoveDirAll((i32, String, bool, bool)),
     ConfirmDeleteFiles((i32, i32)),
     SetNoConfirm(i32),
@@ -3243,11 +3497,11 @@ pub enum Data {
     CancelJob(i32),
     RemovePortForward(i32),
     AddPortForward((i32, String, i32)),
-    #[cfg(not(feature = "flutter"))]
+    #[cfg(all(target_os = "windows", not(feature = "flutter")))]
     ToggleClipboardFile,
     NewRDP,
     SetConfirmOverrideFile((i32, i32, bool, bool, bool)),
-    AddJob((i32, String, String, i32, bool, bool)),
+    AddJob((i32, JobType, String, String, i32, bool, bool)),
     ResumeJob((i32, bool)),
     RecordScreen(bool),
     ElevateDirect,
@@ -3256,6 +3510,7 @@ pub enum Data {
     CloseVoiceCall,
     ResetDecoder(Option<usize>),
     RenameFile((i32, String, String, bool)),
+    TakeScreenshot((i32, String)),
 }
 
 /// Keycode for key events.
@@ -3492,8 +3747,7 @@ pub mod peer_online {
         rendezvous_proto::*,
         sleep,
         socket_client::connect_tcp,
-        tcp::FramedStream,
-        ResultType,
+        ResultType, Stream,
     };
 
     pub async fn query_online_states<F: FnOnce(Vec<String>, Vec<String>)>(ids: Vec<String>, f: F) {
@@ -3516,7 +3770,7 @@ pub mod peer_online {
         }
     }
 
-    async fn create_online_stream() -> ResultType<FramedStream> {
+    async fn create_online_stream() -> ResultType<Stream> {
         let (rendezvous_server, _servers, _contained) =
             crate::get_rendezvous_server(READ_TIMEOUT).await;
         let tmp: Vec<&str> = rendezvous_server.split(":").collect();
@@ -3559,11 +3813,9 @@ pub mod peer_online {
         }
         // Retry for 2 times to get the online response
         for _ in 0..2 {
-            if let Some(msg_in) = crate::common::get_next_nonkeyexchange_msg(
-                &mut socket,
-                Some(timeout.as_millis() as _),
-            )
-            .await
+            if let Some(msg_in) =
+                crate::get_next_nonkeyexchange_msg(&mut socket, Some(timeout.as_millis() as _))
+                    .await
             {
                 match msg_in.union {
                     Some(rendezvous_message::Union::OnlineResponse(online_response)) => {
@@ -3614,4 +3866,126 @@ pub mod peer_online {
             .await;
         }
     }
+}
+
+async fn test_udp_uat(
+    udp_socket: Arc<UdpSocket>,
+    server_addr: SocketAddr,
+    udp_port: Arc<Mutex<u16>>,
+    mut stop_udp_rx: oneshot::Receiver<()>,
+) -> ResultType<()> {
+    let (tx, mut rx) = oneshot::channel::<_>();
+    tokio::spawn(async {
+        if let Ok(v) = crate::test_nat_ipv4().await {
+            tx.send(v).ok();
+        }
+    });
+
+    let start = Instant::now();
+    let mut msg_out = RendezvousMessage::new();
+    msg_out.set_test_nat_request(TestNatRequest {
+        ..Default::default()
+    });
+    // Adaptive retry strategy that works within TCP RTT constraints
+    // Start with aggressive sending, then back off
+    let mut retry_interval = Duration::from_millis(20); // Start fast
+    const MAX_INTERVAL: Duration = Duration::from_millis(200);
+    let mut packets_sent = 0;
+
+    // Send initial burst to improve reliability
+    let data = msg_out.write_to_bytes()?;
+    for _ in 0..2 {
+        if let Err(e) = udp_socket.send_to(&data, server_addr).await {
+            log::warn!("Failed to send initial UDP NAT test packet: {}", e);
+        } else {
+            packets_sent += 1;
+        }
+    }
+    let mut last_send_time = Instant::now();
+    let mut buf = [0u8; 1500];
+
+    loop {
+        tokio::select! {
+            Ok((addr, server)) = &mut rx => {
+                *udp_port.lock().unwrap() = addr.port();
+                log::debug!("UDP NAT test received response from {}: {}", addr, server);
+                break;
+            }
+            _ = &mut stop_udp_rx => {
+                log::debug!("UDP NAT test received stop signal after {} packets", packets_sent);
+                break;
+            }
+            _ = hbb_common::sleep(retry_interval.as_secs_f32()) => {
+                // Adaptive retry: send fewer packets as time goes on
+                let elapsed = last_send_time.elapsed();
+
+                if elapsed >= retry_interval {
+                    // Send single packet (not double) to reduce network load
+                    if let Err(e) = udp_socket.send_to(&data, server_addr).await {
+                        log::warn!("Failed to send UDP NAT test retry packet: {}", e);
+                    } else {
+                        packets_sent += 1;
+                    }
+
+                    // Exponentially increase interval to reduce network pressure
+                    retry_interval = std::cmp::min(
+                        Duration::from_millis((retry_interval.as_millis() as f64 * 1.5) as u64),
+                        MAX_INTERVAL
+                    );
+                    last_send_time = Instant::now();
+                }
+            }
+            res = udp_socket.recv(&mut buf[..]) => {
+                match res {
+                    Ok(n) => {
+                        match RendezvousMessage::parse_from_bytes(&buf[0..n]) {
+                            Ok(msg_in) => {
+                                if let Some(rendezvous_message::Union::TestNatResponse(response)) = msg_in.union {
+                                    *udp_port.lock().unwrap() = response.port as u16;
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                log::warn!("Failed to parse UDP NAT test response: {}", e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("UDP NAT test socket error: {}", e);
+                    }
+                }
+            }
+        }
+    }
+
+    let final_port = *udp_port.lock().unwrap();
+    log::debug!(
+        "UDP NAT test to {:?} finished: time={:?}, port={}, packets_sent={}, success={}",
+        server_addr,
+        start.elapsed(),
+        final_port,
+        packets_sent,
+        final_port > 0
+    );
+    Ok(())
+}
+
+#[inline]
+async fn udp_nat_connect(
+    socket: Arc<UdpSocket>,
+    typ: &'static str,
+) -> ResultType<(Stream, Option<KcpStream>, &'static str)> {
+    crate::punch_udp(socket.clone(), false)
+        .await
+        .map_err(|err| {
+            log::debug!("{err}");
+            anyhow!(err)
+        })?;
+    let res = KcpStream::connect(socket, Duration::from_secs(CONNECT_TIMEOUT as _))
+        .await
+        .map_err(|err| {
+            log::debug!("Failed to connect KCP stream: {}", err);
+            anyhow!(err)
+        })?;
+    Ok((res.1, Some(res.0), typ))
 }

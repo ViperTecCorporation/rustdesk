@@ -1,5 +1,8 @@
 use super::*;
-use hbb_common::{allow_err, platform::linux::DISTRO};
+use hbb_common::{
+    allow_err,
+    platform::linux::{CMD_SH, DISTRO},
+};
 use scrap::{is_cursor_embedded, set_map_err, Capturer, Display, Frame, TraitCapturer};
 use std::io;
 use std::process::{Command, Output};
@@ -21,12 +24,6 @@ pub fn init() {
 }
 
 fn map_err_scrap(err: String) -> io::Error {
-    // to-do: Remove this the following log
-    log::error!(
-        "REMOVE ME ===================================== wayland scrap error {}",
-        &err
-    );
-
     // to-do: Handle error better, do not restart server
     if err.starts_with("Did not receive a reply") {
         log::error!("Fatal pipewire error, {}", &err);
@@ -115,7 +112,7 @@ pub(super) fn is_inited() -> Option<Message> {
 
 fn get_max_desktop_resolution() -> Option<String> {
     // works with Xwayland
-    let output: Output = Command::new("sh")
+    let output: Output = Command::new(CMD_SH.as_str())
         .arg("-c")
         .arg("xrandr | awk '/current/ { print $8,$9,$10 }'")
         .output()
