@@ -1685,6 +1685,7 @@ copy /Y \"{tmp_path}\\{app_name} Tray.lnk\" \"%PROGRAMDATA%\\Microsoft\\Windows\
     // New code should be written in a common function.
     let cmds = format!(
         "
+{uninstall_old_rustdesk}
 {uninstall_str}
 chcp 65001
 md \"{path}\"
@@ -1716,6 +1717,7 @@ copy /Y \"{tmp_path}\\Uninstall {app_name}.lnk\" \"{path}\\\"
 {sleep}
     ",
         display_icon = get_custom_icon(&path, &cur_exe).unwrap_or(exe.to_string()),
+        uninstall_old_rustdesk = get_old_rustdesk_uninstall_cmd(),
         version = crate::VERSION.replace("-", "."),
         build_date = crate::BUILD_DATE,
         after_install = get_after_install(
@@ -1942,6 +1944,33 @@ pub fn is_installed() -> bool {
 pub fn get_reg(name: &str) -> String {
     let (subkey, _, _, _) = get_install_info();
     get_reg_of(&subkey, name)
+}
+
+fn get_old_rustdesk_uninstall_cmd() -> String {
+    if crate::get_app_name() == "RustDesk" {
+        return String::new();
+    }
+
+    for subkey in [
+        get_subkey("RustDesk", false),
+        get_subkey("RustDesk", true),
+        get_subkey(IS1, false),
+        get_subkey(IS1, true),
+    ] {
+        let uninstall = ["QuietUninstallString", "UninstallString"]
+            .into_iter()
+            .map(|name| get_reg_of(&subkey, name))
+            .find(|value| !value.is_empty());
+        if let Some(uninstall) = uninstall {
+            return format!(
+                r#"
+echo Uninstalling previous RustDesk installation
+{uninstall}
+"#
+            );
+        }
+    }
+    String::new()
 }
 
 fn get_reg_of(subkey: &str, name: &str) -> String {

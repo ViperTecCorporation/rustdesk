@@ -216,6 +216,15 @@ def gen_upgrade_info():
             f'{indent}{g_indent_unit}<UpgradeVersion Property="OLD_VERSION_FOUND" Minimum="{major}.0.0" Maximum="{major}.99.99" IncludeMinimum="yes" IncludeMaximum="yes" OnlyDetect="no" IgnoreRemoveFailure="yes" MigrateFeatures="yes" />\n',
             f"{indent}</Upgrade>\n",
         ]
+        if app_name != "RustDesk":
+            rustdesk_upgrade_id = uuid.uuid5(uuid.NAMESPACE_OID, "RustDesk.exe")
+            to_insert_lines.extend(
+                [
+                    f'{indent}<Upgrade Id="{rustdesk_upgrade_id}">\n',
+                    f'{indent}{g_indent_unit}<UpgradeVersion Property="OLD_RUSTDESK_VERSION_FOUND" Minimum="{major}.0.0" Maximum="{major}.99.99" IncludeMinimum="yes" IncludeMaximum="yes" OnlyDetect="no" IgnoreRemoveFailure="yes" MigrateFeatures="yes" />\n',
+                    f"{indent}</Upgrade>\n",
+                ]
+            )
 
         for i, line in enumerate(to_insert_lines):
             lines.insert(index_start + i + 1, line)
