@@ -17,6 +17,7 @@
 		<CustomAction Id="RemoveFirewallRules.SetParam" Return="check" Property="RemoveFirewallRules" Value="0[INSTALLFOLDER_INNER]$(var.ProductExeName).exe" />
 		<CustomAction Id="CreateStartService.SetParam" Return="check" Property="CreateStartService" Value="$(var.Product);&quot;[INSTALLFOLDER_INNER]$(var.ProductExeName).exe&quot; --service" />
 		<CustomAction Id="TryStopDeleteService.SetParam" Return="check" Property="TryStopDeleteService" Value="$(var.Product)" />
+		<CustomAction Id="TryStopDeleteCurrentService.SetParam" Return="check" Property="TryStopDeleteCurrentService" Value="$(var.Product)" />
 		<CustomAction Id="TryStopDeleteOldRustDeskService.SetParam" Return="check" Property="TryStopDeleteOldRustDeskService" Value="RustDesk" />
 
 		<CustomAction Id="LaunchApp" ExeCommand="" Return="asyncNoWait" FileRef="App.exe" />
@@ -43,7 +44,9 @@
 			<Custom Action="SetPropertyServiceStop.SetParam.ConfigKey" Before="SetPropertyServiceStop" Condition="NOT Installed" />
 			<Custom Action="SetPropertyServiceStop.SetParam.PropertyName" Before="SetPropertyServiceStop" Condition="NOT Installed" />
 
-			<!-- Viper build: remove the legacy RustDesk service before creating the new service. -->
+			<!-- Viper build: remove stale service registrations before creating the new service. -->
+			<Custom Action="TryStopDeleteCurrentService" Before="CreateStartService.SetParam" Condition="NOT Installed" />
+			<Custom Action="TryStopDeleteCurrentService.SetParam" Before="TryStopDeleteCurrentService" Condition="NOT Installed" />
 			<Custom Action="TryStopDeleteOldRustDeskService" Before="CreateStartService.SetParam" Condition="NOT Installed" />
 			<Custom Action="TryStopDeleteOldRustDeskService.SetParam" Before="TryStopDeleteOldRustDeskService" Condition="NOT Installed" />
 
