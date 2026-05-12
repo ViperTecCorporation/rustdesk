@@ -48,10 +48,17 @@ install -Dm 644 $HBB/res/scalable.svg "%{buildroot}/usr/share/icons/hicolor/scal
 case "$1" in
   1)
     # for install
+    systemctl stop rustdesk || true
+    systemctl disable rustdesk || true
+    rm /etc/systemd/system/rustdesk.service /usr/lib/systemd/system/rustdesk.service /usr/lib/systemd/user/rustdesk.service || true
+    systemctl daemon-reload || true
   ;;
   2)
     # for upgrade
     systemctl stop rustdesk || true
+    systemctl disable rustdesk || true
+    rm /etc/systemd/system/rustdesk.service /usr/lib/systemd/system/rustdesk.service /usr/lib/systemd/user/rustdesk.service || true
+    systemctl daemon-reload || true
   ;;
 esac
 

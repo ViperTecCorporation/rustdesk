@@ -6,7 +6,10 @@ case $1 in
     install|upgrade)
 		INITSYS=$(ls -al /proc/1/exe | awk -F' ' '{print $NF}' | awk -F'/' '{print $NF}')
 		if [ "systemd" == "${INITSYS}" ]; then
-			service rustdesk stop || true
+			systemctl stop rustdesk || true
+			systemctl disable rustdesk || true
+			rm -f /etc/systemd/system/rustdesk.service /usr/lib/systemd/system/rustdesk.service /usr/lib/systemd/user/rustdesk.service || true
+			systemctl daemon-reload || true
       sleep 1
       rm -rf /usr/bin/libsciter-gtk.so
 		fi

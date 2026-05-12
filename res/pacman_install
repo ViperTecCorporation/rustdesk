@@ -1,6 +1,10 @@
 # arg 1:  the new package version
-#pre_install() {
-#}
+pre_install() {
+	systemctl stop rustdesk || true
+	systemctl disable rustdesk || true
+	rm /etc/systemd/system/rustdesk.service /usr/lib/systemd/system/rustdesk.service /usr/lib/systemd/user/rustdesk.service || true
+	systemctl daemon-reload || true
+}
 
 # arg 1:  the new package version
 post_install() {
@@ -18,6 +22,9 @@ post_install() {
 # arg 2:  the old package version
 pre_upgrade() {
     systemctl stop rustdesk || true
+    systemctl disable rustdesk || true
+    rm /etc/systemd/system/rustdesk.service /usr/lib/systemd/system/rustdesk.service /usr/lib/systemd/user/rustdesk.service || true
+    systemctl daemon-reload || true
 }
 
 # arg 1:  the new package version
