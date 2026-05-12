@@ -114,10 +114,11 @@ def read_lines_and_start_index(file_path, tag_start, tag_end):
 def insert_components_between_tags(lines, index_start, app_name, dist_dir):
     indent = g_indent_unit * 3
     path = Path(dist_dir)
+    exe_name = "rustdesk"
     idx = 1
     for file_path in path.glob("**/*"):
         if file_path.is_file():
-            if file_path.name.lower() == f"{app_name}.exe".lower():
+            if file_path.name.lower() == f"{exe_name}.exe".lower():
                 continue
 
             subdir = str(file_path.parent.relative_to(path))
@@ -161,6 +162,7 @@ def gen_pre_vars(args, dist_dir):
             f'{indent}<?define Product="{args.app_name}" ?>\n',
             f'{indent}<?define Description="{args.app_name} Installer" ?>\n',
             f'{indent}<?define ProductLower="{args.app_name.lower()}" ?>\n',
+            f'{indent}<?define ProductExeName="rustdesk" ?>\n',
             f'{indent}<?define RegKeyRoot=".$(var.ProductLower)" ?>\n',
             f'{indent}<?define RegKeyInstall="$(var.RegKeyRoot)\\Install" ?>\n',
             f'{indent}<?define BuildDir="{dist_dir}" ?>\n',
@@ -314,7 +316,7 @@ def gen_custom_ARPSYSTEMCOMPONENT_True(args, dist_dir):
             f'{indent}<RegistryValue Type="string" Name="DisplayName" Value="{args.app_name}" />\n'
         )
         lines_new.append(
-            f'{indent}<RegistryValue Type="string" Name="DisplayIcon" Value="[INSTALLFOLDER_INNER]{args.app_name}.exe" />\n'
+            f'{indent}<RegistryValue Type="string" Name="DisplayIcon" Value="[INSTALLFOLDER_INNER]$(var.ProductExeName).exe" />\n'
         )
         lines_new.append(
             f'{indent}<RegistryValue Type="string" Name="DisplayVersion" Value="{g_version}" />\n'
@@ -455,7 +457,7 @@ def prepare_resources():
 
 
 def init_global_vars(dist_dir, app_name, args):
-    dist_app = dist_dir.joinpath(app_name + ".exe")
+    dist_app = dist_dir.joinpath("rustdesk.exe")
 
     def read_process_output(args):
         process = subprocess.Popen(
